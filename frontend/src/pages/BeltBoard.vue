@@ -15,9 +15,12 @@ import RouteMissingPanel from '@/components/common/RouteMissingPanel.vue'
 import { useReefStore } from '@/stores/reefStore'
 import { ORIENTATION_ORDER, useBeltStore } from '@/stores/beltStore'
 import { useSurveyStore } from '@/stores/surveyStore'
+import { useInterpretStore } from '@/stores/interpretStore'
+import ReconcileTag from '@/components/common/ReconcileTag.vue'
 import { BELT_LENGTH_PRESETS, ORIENTATIONS } from '@/types/belt'
 import type { Belt, Orientation } from '@/types/belt'
 import { bleachGrade, bleachIndex, coralCoveragePct, fishDensity } from '@/utils/bleach'
+import { reconcileCoverage } from '@/types/interpretation'
 import { initDatabase } from '@/utils/db'
 
 const route = useRoute()
@@ -25,6 +28,7 @@ const router = useRouter()
 const reefStore = useReefStore()
 const beltStore = useBeltStore()
 const surveyStore = useSurveyStore()
+const interpretStore = useInterpretStore()
 
 const siteId = computed(() => String(route.params.id ?? ''))
 const site = computed(() => reefStore.siteById(siteId.value))
@@ -41,7 +45,7 @@ const form = reactive({
   observer: ''
 })
 
-/** 样带行：回显珊瑚记录数、鱼类记录数、覆盖率与白化指数 */
+/** 样带行：回显珊瑚记录数、鱼类记录数、覆盖率、白化指数与影像判读对账状态 */
 const rows = computed(() =>
   beltStore.beltsOfSite(siteId.value).map((belt) => {
     const corals = surveyStore.coralsOfBelt(belt.id)
@@ -49,15 +53,19 @@ const rows = computed(() =>
     const coverCmTotal = corals.reduce((sum, coral) => sum + coral.coverCm, 0)
     const index = bleachIndex(corals)
     const fishTotal = fishes.filter((fish) => fish.category === '鱼类').reduce((sum, fish) => sum + fish.count, 0)
+    const interpretation = interpretStore.interpretationOfBelt(belt.id)
+    const coveragePct = coralCoveragePct(coverCmTotal, belt.lengthM)
     return {
       belt,
       coralCount: corals.length,
       fishCount: fishes.length,
       coverCmTotal,
-      coveragePct: coralCoveragePct(coverCmTotal, belt.lengthM),
+      coveragePct,
       bleachIndex: index,
       grade: bleachGrade(index),
-      fishDensity: fishDensity(fishTotal, belt.lengthM)
+      fishDensity: fishDensity(fishTotal, belt.lengthM),
+      interpretedCoveragePct: interpretation?.coveragePct ?? null,
+      reconcileStatus: reconcileCoverage({ interpretation, fieldCoveragePct: coveragePct })
     }
   })
 )
@@ -193,6 +201,7 @@ function gotoFishes(belt: Belt): void {
 onMounted(() => {
   if (reefStore.reefs.length === 0) void initDatabase()
   if (site.value) reefStore.selectSite(site.value.id)
+  interpretStore.start()
 })
 </script>
 
@@ -305,6 +314,15 @@ onMounted(() => {
           <template #default="{ row }">
             <BleachTag :level="row.grade" size="small" />
             <div class="gb-hint gb-mono">指数 {{ row.bleachIndex }}</div>
+          </template>
+        </el-table-column>
+        <el-table-column label="判读对账" width="150" align="center">
+          <template #default="{ row }">
+            <ReconcileTag :status="row.reconcileStatus" size="small" />
+            <div v-if="row.interpretedCoveragePct !== null && row.reconcileStatus !== 'pending'" class="gb-hint gb-mono">
+              判读 {{ row.interpretedCoveragePct }}%
+            </div>
+            <div v-else-if="row.reconcileStatus === 'pending'" class="gb-hint">暂用外业覆盖率</div>
           </template>
         </el-table-column>
         <el-table-column label="操作" width="260" fixed="right">

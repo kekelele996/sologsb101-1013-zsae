@@ -11,9 +11,11 @@ import type { Site } from '@/types/site'
 import type { Belt } from '@/types/belt'
 import type { CoralRecord } from '@/types/coralRecord'
 import type { FishCount } from '@/types/fishCount'
+import type { Interpretation } from '@/types/interpretation'
+import { bleachGrade, bleachIndex, coralCoveragePct } from '@/utils/bleach'
 
 /** 当前数据结构版本号：每次调整字段结构必须 +1 并补迁移 */
-export const DB_VERSION = 2
+export const DB_VERSION = 3
 
 /** 数据库名（浏览器 IndexedDB 中的库名） */
 export const DB_NAME = 'gbcoralbelt'
@@ -35,6 +37,8 @@ export interface BackupPayload {
   belts: Belt[]
   corals: CoralRecord[]
   fishes: FishCount[]
+  /** v3 起：影像判读室的判读记录；v1/v2 备份缺失时按空数组合并 */
+  interpretations: Interpretation[]
 }
 
 export class CoralBeltDatabase extends Dexie {
@@ -43,6 +47,7 @@ export class CoralBeltDatabase extends Dexie {
   belts!: Table<Belt, string>
   corals!: Table<CoralRecord, string>
   fishes!: Table<FishCount, string>
+  interpretations!: Table<Interpretation, string>
 
   constructor() {
     super(DB_NAME)
@@ -86,10 +91,79 @@ export class CoralBeltDatabase extends Dexie {
             })
         }
       })
+
+    // v3：新增影像判读表 interpretations（判读覆盖率 / 判读等级 / 判读人，beltId 唯一）。
+    // 旧数据没有判读记录，升级时按现有珊瑚记录为每条样带补一版并标成初始值（source: initial）。
+    this.version(DB_VERSION)
+      .stores({
+        reefs: 'id, name, location, protectStatus, areaKm2, manager, updatedAt',
+        sites: 'id, reefId, no, lat, lng, depthM, substrate, updatedAt',
+        belts: 'id, siteId, no, lengthM, orientation, surveyDate, observer, updatedAt',
+        corals: 'id, beltId, genus, form, coverCm, bleachLevel, updatedAt',
+        fishes: 'id, beltId, family, count, sizeClass, category, updatedAt',
+        interpretations: 'id, beltId, reviewer, reviewedDate, source, revised, updatedAt'
+      })
+      .upgrade(async (tx) => {
+        const belts = (await tx.table('belts').toArray()) as Belt[]
+        const corals = (await tx.table('corals').toArray()) as CoralRecord[]
+        const existingBeltIds = new Set(
+          (await tx.table('interpretations').toArray()).map((row: Interpretation) => row.beltId)
+        )
+        const now = Date.now()
+        const initials: Interpretation[] = []
+        belts.forEach((belt, index) => {
+          if (existingBeltIds.has(belt.id)) return
+          const beltCorals = corals.filter((coral) => coral.beltId === belt.id)
+          const coverCmTotal = beltCorals.reduce((sum, coral) => sum + Math.max(0, coral.coverCm), 0)
+          const indexValue = bleachIndex(beltCorals)
+          initials.push({
+            id: `int_init_${belt.id}`,
+            beltId: belt.id,
+            coveragePct: coralCoveragePct(coverCmTotal, belt.lengthM),
+            bleachLevel: bleachGrade(indexValue),
+            reviewer: '',
+            reviewedDate: typeof belt.surveyDate === 'string' ? belt.surveyDate : '',
+            remark: '升级时按外业珊瑚记录补录的初始值，待影像判读室正式判读',
+            source: 'initial',
+            revised: false,
+            createdAt: now + index,
+            updatedAt: now + index
+          })
+        })
+        if (initials.length > 0) await tx.table('interpretations').bulkAdd(initials)
+      })
   }
 }
 
 export const db = new CoralBeltDatabase()
+
+/**
+ * 判读室落账：只写 interpretations 一张表（独立事务），与外业那份完全隔离。
+ * 落账失败时仅重试本次判读写操作，外业的样带 / 珊瑚记录不受影响、不会回滚。
+ */
+export async function putInterpretationWithRetry(
+  row: Interpretation,
+  options: { retries?: number; retryDelayMs?: number } = {}
+): Promise<void> {
+  const retries = options.retries ?? 2
+  const retryDelayMs = options.retryDelayMs ?? 200
+  let lastError: unknown = null
+  for (let attempt = 0; attempt <= retries; attempt += 1) {
+    try {
+      // 事务仅包含 interpretations 表：任何失败都不会波及外业数据表
+      await db.transaction('rw', [db.interpretations], async () => {
+        await db.interpretations.put(row)
+      })
+      return
+    } catch (error) {
+      lastError = error
+      if (attempt < retries) {
+        await new Promise((resolve) => setTimeout(resolve, retryDelayMs * (attempt + 1)))
+      }
+    }
+  }
+  throw lastError instanceof Error ? lastError : new Error('判读记录落账失败')
+}
 
 /** 生成主键：短前缀 + 时间戳 + 随机串，避免多标签页写入冲突 */
 export function createId(prefix: string): string {
@@ -130,6 +204,18 @@ interface SeedFish {
   count: number
   sizeClass: FishCount['sizeClass']
   category: FishCount['category']
+}
+
+interface SeedInterpretation {
+  id: string
+  beltId: string
+  coveragePct: number
+  bleachLevel: Interpretation['bleachLevel']
+  reviewer: string
+  reviewedDate: string
+  remark: string
+  source: Interpretation['source']
+  revised: boolean
 }
 
 interface SeedBelt {
@@ -314,7 +400,59 @@ export async function seedDemoData(): Promise<void> {
     }
   ]
 
-  await db.transaction('rw', [db.reefs, db.sites, db.belts, db.corals, db.fishes], async () => {
+  /**
+   * 影像判读室判读记录：与外业数据各存各的。
+   * 刻意覆盖四种对账状态——对账一致（ql01_a / yr01_a）、挂起复核（ql01_b，差 12.4 个百分点）、
+   * 待判读（ql02_a，判读室尚未判）、重判放行（dz01_a，曾挂起后重判自动放行）。
+   */
+  const interpretations: SeedInterpretation[] = [
+    {
+      id: 'int_ql01_a',
+      beltId: 'belt_ql01_a',
+      coveragePct: 60,
+      bleachLevel: '轻',
+      reviewer: '苏映雪',
+      reviewedDate: today,
+      remark: '照片判读覆盖率 60%，与外业 58% 接近',
+      source: 'judged',
+      revised: false
+    },
+    {
+      id: 'int_ql01_b',
+      beltId: 'belt_ql01_b',
+      coveragePct: 55,
+      bleachLevel: '中',
+      reviewer: '何知秋',
+      reviewedDate: today,
+      remark: '照片中枝状珊瑚阴影疑似覆盖，判得偏高，与外业差 12.4 个百分点，挂起等复核',
+      source: 'judged',
+      revised: false
+    },
+    {
+      id: 'int_yr01_a',
+      beltId: 'belt_yr01_a',
+      coveragePct: 25,
+      bleachLevel: '中',
+      reviewer: '何知秋',
+      reviewedDate: today,
+      remark: '深水站位照片偏暗，判读覆盖率 25%，与外业 27% 接近',
+      source: 'judged',
+      revised: false
+    },
+    {
+      id: 'int_dz01_a',
+      beltId: 'belt_dz01_a',
+      coveragePct: 34,
+      bleachLevel: '重',
+      reviewer: '苏映雪',
+      reviewedDate: today,
+      remark: '首判 46% 与外业差 12.8 个百分点被挂起；重判修正为 34%，自动放行',
+      source: 'judged',
+      revised: true
+    }
+  ]
+
+  await db.transaction('rw', [db.reefs, db.sites, db.belts, db.corals, db.fishes, db.interpretations], async () => {
     const stamp = (offset: number): { createdAt: number; updatedAt: number } => ({
       createdAt: now + offset,
       updatedAt: now + offset
@@ -340,6 +478,9 @@ export async function seedDemoData(): Promise<void> {
         belt.fishes.map((fish, fishIndex) => ({ ...fish, ...stamp(400 + beltIndex * 100 + fishIndex) }))
       )
     )
+    await db.interpretations.bulkPut(
+      interpretations.map((item, index) => ({ ...item, ...stamp(500 + index) }))
+    )
   })
 }
 
@@ -355,9 +496,20 @@ export async function initDatabase(): Promise<void> {
 
 /** 清空全部业务表（导入覆盖与重置共用） */
 export async function clearAllTables(): Promise<void> {
-  await db.transaction('rw', [db.reefs, db.sites, db.belts, db.corals, db.fishes], async () => {
-    await Promise.all([db.reefs.clear(), db.sites.clear(), db.belts.clear(), db.corals.clear(), db.fishes.clear()])
-  })
+  await db.transaction(
+    'rw',
+    [db.reefs, db.sites, db.belts, db.corals, db.fishes, db.interpretations],
+    async () => {
+      await Promise.all([
+        db.reefs.clear(),
+        db.sites.clear(),
+        db.belts.clear(),
+        db.corals.clear(),
+        db.fishes.clear(),
+        db.interpretations.clear()
+      ])
+    }
+  )
 }
 
 /** 清空并重新播种演示数据 */
@@ -368,14 +520,15 @@ export async function resetDatabase(): Promise<void> {
 
 /** 统计各表行数，供页脚概览与覆盖度页展示 */
 export async function countAll(): Promise<Record<string, number>> {
-  const [reefs, sites, belts, corals, fishes] = await Promise.all([
+  const [reefs, sites, belts, corals, fishes, interpretations] = await Promise.all([
     db.reefs.count(),
     db.sites.count(),
     db.belts.count(),
     db.corals.count(),
-    db.fishes.count()
+    db.fishes.count(),
+    db.interpretations.count()
   ])
-  return { reefs, sites, belts, corals, fishes }
+  return { reefs, sites, belts, corals, fishes, interpretations }
 }
 
 /** 写入结构版本号到 localStorage，便于覆盖度页比对 */

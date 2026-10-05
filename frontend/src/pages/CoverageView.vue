@@ -13,12 +13,15 @@ import FilterBar from '@/components/common/FilterBar.vue'
 import type { FilterModel } from '@/types/filter'
 import { buildQuery, queryToArray, queryToBool } from '@/types/filter'
 import BleachTag from '@/components/common/BleachTag.vue'
+import ReconcileTag from '@/components/common/ReconcileTag.vue'
 import StatBadge from '@/components/common/StatBadge.vue'
 import EmptyPanel from '@/components/common/EmptyPanel.vue'
 import { useReefStore } from '@/stores/reefStore'
 import { useSurveyStore } from '@/stores/surveyStore'
+import { useInterpretStore } from '@/stores/interpretStore'
 import { BLEACH_LEVELS } from '@/types/coralRecord'
 import type { BleachLevel } from '@/types/coralRecord'
+import { COVERAGE_DIFF_THRESHOLD_PCT } from '@/types/interpretation'
 import { BLEACH_COLOR } from '@/utils/bleach'
 import {
   DB_NAME,
@@ -30,8 +33,6 @@ import {
   type BackupPayload
 } from '@/utils/db'
 import {
-  buildBackupPayload,
-  buildReefSummaries,
   countPayload,
   exportBackupJson,
   importBackup,
@@ -45,13 +46,20 @@ const route = useRoute()
 const router = useRouter()
 const reefStore = useReefStore()
 const surveyStore = useSurveyStore()
+const interpretStore = useInterpretStore()
 
-const EMPTY_COUNTS: CountMap = { reefs: 0, sites: 0, belts: 0, corals: 0, fishes: 0 }
+const EMPTY_COUNTS: CountMap = {
+  reefs: 0,
+  sites: 0,
+  belts: 0,
+  corals: 0,
+  fishes: 0,
+  interpretations: 0
+}
 
 const counts = ref<CountMap>(EMPTY_COUNTS)
 const lastBackupAt = ref<string | null>(null)
 const stampedVersion = ref<number>(DB_VERSION)
-const reefSummaries = ref<ReturnType<typeof buildReefSummaries>>([])
 const overwriteOnImport = ref(true)
 const fileList = ref<UploadFile[]>([])
 const busy = ref(false)
@@ -63,23 +71,54 @@ const filterModel = computed<FilterModel>(() => ({
   bleachLevels: surveyStore.filter.bleachLevels
 }))
 
-const rows = computed(() => surveyStore.filteredCoverageRows)
+/**
+ * 汇总主表：以影像判读室的对账台账为同一口径（外业覆盖率 + 判读覆盖率 + 对账状态），
+ * 再叠加覆盖度页原有的关键字 / 礁区 / 白化等级 / 仅看白化筛选。
+ */
+const allRows = computed(() => interpretStore.reconcileRows)
 
-const totals = computed(() => ({
-  belts: rows.value.length,
-  coralCount: rows.value.reduce((sum, row) => sum + row.coralCount, 0),
-  coverCmTotal: rows.value.reduce((sum, row) => sum + row.coverCmTotal, 0),
-  fishTotal: rows.value.reduce((sum, row) => sum + row.fishTotal, 0),
-  avgCoveragePct:
-    rows.value.length === 0
-      ? 0
-      : Number((rows.value.reduce((sum, row) => sum + row.coveragePct, 0) / rows.value.length).toFixed(2)),
-  avgBleachIndex:
-    rows.value.length === 0
-      ? 0
-      : Number((rows.value.reduce((sum, row) => sum + row.bleachIndex, 0) / rows.value.length).toFixed(2)),
-  bleachedBelts: rows.value.filter((row) => row.bleachedSharePct > 0).length
-}))
+const rows = computed(() =>
+  allRows.value.filter((row) => {
+    const filterState = surveyStore.filter
+    const keyword = filterState.keyword.trim()
+    if (keyword.length > 0) {
+      const haystack = `${row.reefName}${row.siteNo}${row.beltNo}${row.observer}${row.reviewer ?? ''}`
+      if (!haystack.includes(keyword)) return false
+    }
+    if (filterState.reefIds.length > 0 && !filterState.reefIds.includes(row.reefId)) return false
+    if (filterState.bleachLevels.length > 0) {
+      const matched = filterState.bleachLevels.some((level) => row.distribution[level] > 0)
+      if (!matched) return false
+    }
+    if (filterState.onlyBleached && row.bleachedSharePct <= 0) return false
+    return true
+  })
+)
+
+/** 计入定稿结论的样带（排除挂起等复核） */
+const conclusiveRows = computed(() => rows.value.filter((row) => row.conclusive))
+
+const totals = computed(() => {
+  const basis = conclusiveRows.value
+  return {
+    belts: rows.value.length,
+    conclusiveBelts: basis.length,
+    heldBelts: rows.value.filter((row) => row.status === 'held').length,
+    pendingBelts: rows.value.filter((row) => row.status === 'pending').length,
+    coralCount: basis.reduce((sum, row) => sum + row.coralCount, 0),
+    coverCmTotal: basis.reduce((sum, row) => sum + row.fieldCoverCmTotal, 0),
+    fishTotal: basis.reduce((sum, row) => sum + row.fishTotal, 0),
+    avgCoveragePct:
+      basis.length === 0
+        ? 0
+        : Number((basis.reduce((sum, row) => sum + row.fieldCoveragePct, 0) / basis.length).toFixed(2)),
+    avgBleachIndex:
+      basis.length === 0
+        ? 0
+        : Number((basis.reduce((sum, row) => sum + row.bleachIndex, 0) / basis.length).toFixed(2)),
+    bleachedBelts: basis.filter((row) => row.bleachedSharePct > 0).length
+  }
+})
 
 /** 当前筛选结果内的白化等级分布 */
 const distribution = computed<Record<BleachLevel, number>>(() => {
@@ -99,34 +138,15 @@ function barPercent(value: number, total: number): string {
   return `${Math.min(100, (value / total) * 100).toFixed(1)}%`
 }
 
+/** 挂起 / 待判读样带整行着色（el-table 行类名） */
+function rowClassName({ row }: { row: { status: string } }): string {
+  return `is-${row.status}`
+}
+
 async function refresh(): Promise<void> {
   counts.value = (await countAll()) as CountMap
   lastBackupAt.value = readLastBackupAt()
   stampedVersion.value = readStampedDbVersion()
-  const payload = await buildBackupPayload()
-  reefSummaries.value = buildReefSummaries(payload, surveyStore.coverageRows.map((row) => ({
-    beltId: row.beltId,
-    beltNo: row.beltNo,
-    reefId: row.reefId,
-    reefName: row.reefName,
-    siteId: row.siteId,
-    siteNo: row.siteNo,
-    lengthM: row.lengthM,
-    orientation: row.orientation,
-    surveyDate: row.surveyDate,
-    observer: row.observer,
-    coralCount: row.coralCount,
-    coverCmTotal: row.coverCmTotal,
-    coveragePct: row.coveragePct,
-    bleachIndex: row.bleachIndex,
-    grade: row.grade,
-    bleachedSharePct: row.bleachedSharePct,
-    distribution: row.distribution,
-    fishTotal: row.fishTotal,
-    invertebrateTotal: row.invertebrateTotal,
-    fishDensity: row.fishDensity,
-    conclusion: ''
-  })))
 }
 
 function handleFilterChange(): void {
@@ -214,15 +234,28 @@ async function handleDatabaseReset(): Promise<void> {
 }
 
 async function copySummary(): Promise<void> {
-  const text = rows.value
-    .map(
-      (row) =>
-        `${row.reefName}｜站位 ${row.siteNo}｜样带 ${row.beltNo}（${row.orientation}向 ${row.lengthM} m）：珊瑚覆盖率 ${row.coveragePct}%，白化指数 ${row.bleachIndex}（${row.grade}），白化占比 ${row.bleachedSharePct}%，鱼类 ${row.fishTotal} 尾（${row.fishDensity} 尾/100m²）`
-    )
+  const text = conclusiveRows.value
+    .map((row) => {
+      const reconcileNote =
+        row.status === 'pending'
+          ? '【判读室未判，暂按外业】'
+          : row.status === 'released'
+            ? '【重判放行】'
+            : ''
+      return (
+        `${row.reefName}｜站位 ${row.siteNo}｜样带 ${row.beltNo}（${row.orientation}向 ${row.lengthM} m）：` +
+        `外业覆盖率 ${row.fieldCoveragePct}%${
+          row.interpretedCoveragePct === null ? '' : `，判读覆盖率 ${row.interpretedCoveragePct}%（差 ${row.coverageDiffPct} 点）`
+        }，白化指数 ${row.bleachIndex}（${row.fieldGrade}），白化占比 ${row.bleachedSharePct}%，` +
+        `鱼类 ${row.fishTotal} 尾（${row.fishDensityValue} 尾/100m²）${reconcileNote}`
+      )
+    })
     .join('\n')
+  const held = rows.value.filter((row) => row.status === 'held')
+  const heldNote = held.length > 0 ? `\n另有 ${held.length} 条样带两侧差过 ${COVERAGE_DIFF_THRESHOLD_PCT} 点挂起等复核，未计入本结论。` : ''
   try {
-    await navigator.clipboard.writeText(text)
-    notice.value = '覆盖度结论已复制到剪贴板。'
+    await navigator.clipboard.writeText(`${text}${heldNote}`)
+    notice.value = heldNote ? '定稿结论已复制（挂起样带已剔除并附说明）。' : '覆盖度结论已复制到剪贴板。'
     ElMessage.success(notice.value)
   } catch {
     notice.value = '当前浏览器不允许读取剪贴板，请手动选中表格内容复制。'
@@ -231,6 +264,8 @@ async function copySummary(): Promise<void> {
 }
 
 onMounted(() => {
+  reefStore.start()
+  interpretStore.start()
   surveyStore.patchFilter({
     keyword: typeof route.query.kw === 'string' ? route.query.kw : '',
     reefIds: queryToArray(route.query.reef),
@@ -249,7 +284,7 @@ onMounted(() => {
       <div>
         <h2 class="page__title">白化等级评定与覆盖度汇总</h2>
         <p class="gb-hint">
-          按样带汇总珊瑚覆盖率、白化指数（按覆盖长度加权，0 ~ 4）与鱼类密度，并可按礁区、白化等级筛选；同时提供结构版本查看与 JSON 导入导出。
+          按样带编号对外业覆盖率与影像判读室判读覆盖率：差过 {{ COVERAGE_DIFF_THRESHOLD_PCT }} 个百分点挂起等复核（不计入定稿），判读室未判的暂按外业出并标注，重判后自动放行。
         </p>
       </div>
       <div class="page__actions">
@@ -261,10 +296,24 @@ onMounted(() => {
 
     <el-alert v-if="notice" type="success" :closable="false" show-icon :title="notice" />
 
+    <el-alert
+      v-if="totals.heldBelts > 0 || totals.pendingBelts > 0"
+      :type="totals.heldBelts > 0 ? 'warning' : 'info'"
+      :closable="false"
+      show-icon
+      class="gb-panel"
+    >
+      <template #title>
+        定稿口径：挂起等复核 {{ totals.heldBelts }} 条不计入下方礁区结论；判读室尚未判读 {{ totals.pendingBelts }}
+        条先按外业那份出并标注；重判后的样带自动放行。
+      </template>
+    </el-alert>
+
     <div class="gb-stats-row">
       <StatBadge label="样带数" :value="totals.belts" suffix="条" icon="Files" />
-      <StatBadge label="珊瑚记录" :value="totals.coralCount" suffix="条" tone="info" icon="Histogram" />
-      <StatBadge label="覆盖长度合计" :value="totals.coverCmTotal" suffix="cm" tone="success" icon="Odometer" />
+      <StatBadge label="计入定稿" :value="totals.conclusiveBelts" suffix="条" tone="success" icon="CircleCheckFilled" />
+      <StatBadge label="挂起复核" :value="totals.heldBelts" suffix="条" tone="danger" icon="WarningFilled" />
+      <StatBadge label="待判读" :value="totals.pendingBelts" suffix="条" tone="warning" icon="Clock" />
       <StatBadge label="平均覆盖率" :value="totals.avgCoveragePct" suffix="%" :percent="Math.min(100, totals.avgCoveragePct)" icon="PieChart" />
       <StatBadge
         label="平均白化指数"
@@ -273,7 +322,6 @@ onMounted(() => {
         :tone="totals.avgBleachIndex > 1 ? 'warning' : 'success'"
         :icon="totals.avgBleachIndex > 1 ? 'WarningFilled' : 'DataLine'"
       />
-      <StatBadge label="鱼类合计" :value="totals.fishTotal" suffix="尾" tone="warning" icon="TrendCharts" />
     </div>
 
     <FilterBar
@@ -333,7 +381,14 @@ onMounted(() => {
         compact
       />
 
-      <el-table v-else :data="rows" border stripe class="gb-table-compact">
+      <el-table
+        v-else
+        :data="rows"
+        border
+        stripe
+        class="gb-table-compact"
+        :row-class-name="rowClassName"
+      >
         <el-table-column label="礁区 / 站位" min-width="180">
           <template #default="{ row }">
             <div>{{ row.reefName }}</div>
@@ -345,24 +400,47 @@ onMounted(() => {
             <span class="gb-mono">{{ row.lengthM }} m</span>
           </template>
         </el-table-column>
-        <el-table-column label="珊瑚记录" width="100" align="right">
+        <el-table-column label="珊瑚记录" width="90" align="right">
           <template #default="{ row }">
             <span class="gb-mono">{{ row.coralCount }}</span>
           </template>
         </el-table-column>
-        <el-table-column label="覆盖率" width="130" align="right">
+        <el-table-column label="外业覆盖率" width="120" align="right">
           <template #default="{ row }">
-            <span class="gb-mono">{{ row.coveragePct }}%</span>
-            <div class="gb-hint gb-mono">{{ row.coverCmTotal }} cm</div>
+            <span class="gb-mono">{{ row.fieldCoveragePct }}%</span>
+            <div class="gb-hint gb-mono">{{ row.fieldCoverCmTotal }} cm</div>
           </template>
         </el-table-column>
-        <el-table-column label="白化评定" width="170">
+        <el-table-column label="判读覆盖率" width="130" align="right">
           <template #default="{ row }">
-            <BleachTag :level="row.grade" size="small" />
-            <div class="gb-hint gb-mono">指数 {{ row.bleachIndex }} · 白化占比 {{ row.bleachedSharePct }}%</div>
+            <el-tag v-if="row.status === 'pending'" size="small" type="warning" effect="plain">
+              {{ row.isInitial ? '初始值·暂用外业' : '未判读·暂用外业' }}
+            </el-tag>
+            <span v-else class="gb-mono">{{ row.interpretedCoveragePct }}%</span>
           </template>
         </el-table-column>
-        <el-table-column label="白化等级分布 (cm)" min-width="220">
+        <el-table-column label="差值 / 对账" width="150" align="center">
+          <template #default="{ row }">
+            <div v-if="row.status !== 'pending' && row.coverageDiffPct !== null" class="gb-mono" :class="{ 'coverage-view__danger': row.coverageDiffPct > COVERAGE_DIFF_THRESHOLD_PCT }">
+              差 {{ row.coverageDiffPct }} 点
+            </div>
+            <div v-else class="gb-hint">—</div>
+            <ReconcileTag :status="row.status" size="small" />
+          </template>
+        </el-table-column>
+        <el-table-column label="外业白化" width="160">
+          <template #default="{ row }">
+            <BleachTag :level="row.fieldGrade" size="small" />
+            <div class="gb-hint gb-mono">指数 {{ row.bleachIndex }} · 占比 {{ row.bleachedSharePct }}%</div>
+          </template>
+        </el-table-column>
+        <el-table-column label="判读等级" width="90" align="center">
+          <template #default="{ row }">
+            <BleachTag v-if="row.status !== 'pending' && row.interpretedGrade" :level="row.interpretedGrade" size="small" :icon="false" />
+            <span v-else class="gb-hint">—</span>
+          </template>
+        </el-table-column>
+        <el-table-column label="白化等级分布 (cm)" min-width="200">
           <template #default="{ row }">
             <div class="page__mini-bars">
               <span
@@ -371,7 +449,7 @@ onMounted(() => {
                 class="page__mini-bar"
                 :style="{
                   background: BLEACH_COLOR[level],
-                  width: barPercent(row.distribution[level], row.coverCmTotal),
+                  width: barPercent(row.distribution[level], row.fieldCoverCmTotal),
                   opacity: row.distribution[level] > 0 ? 1 : 0.15
                 }"
                 :title="`${level}：${row.distribution[level]} cm`"
@@ -379,21 +457,16 @@ onMounted(() => {
             </div>
           </template>
         </el-table-column>
-        <el-table-column label="鱼类" width="130" align="right">
+        <el-table-column label="鱼类" width="120" align="right">
           <template #default="{ row }">
             <span class="gb-mono">{{ row.fishTotal }} 尾</span>
-            <div class="gb-hint gb-mono">{{ row.fishDensity }} 尾/100m²</div>
+            <div class="gb-hint gb-mono">{{ row.fishDensityValue }} 尾/100m²</div>
           </template>
         </el-table-column>
-        <el-table-column label="无脊椎动物" width="120" align="right">
-          <template #default="{ row }">
-            <span class="gb-mono">{{ row.invertebrateTotal }} 个</span>
-          </template>
-        </el-table-column>
-        <el-table-column label="调查" min-width="150">
+        <el-table-column label="判读人 / 调查" min-width="150">
           <template #default="{ row }">
             <div class="gb-mono">{{ row.surveyDate }}</div>
-            <div class="gb-hint">{{ row.observer || '未填写调查人' }}</div>
+            <div class="gb-hint">判读：{{ row.reviewer || '未判读' }} ｜ 外业：{{ row.observer || '未填' }}</div>
           </template>
         </el-table-column>
       </el-table>
@@ -401,34 +474,38 @@ onMounted(() => {
 
     <el-card shadow="never" class="gb-panel">
       <div class="gb-panel-title">
-        <h3>按礁区的白化评定</h3>
-        <span class="gb-hint">平均白化指数为礁区内各样带白化指数的算术平均</span>
+        <h3>按礁区的白化评定（定稿口径）</h3>
+        <span class="gb-hint">
+          定稿报告照旧：平均白化指数只平均未挂起样带；括号标注挂起 / 待判读 / 放行条数
+        </span>
       </div>
-      <el-table :data="reefSummaries" border stripe class="gb-table-compact">
+      <el-table :data="interpretStore.reefSummaries" border stripe class="gb-table-compact">
         <el-table-column prop="reefName" label="礁区" min-width="160" />
-        <el-table-column prop="protectStatus" label="保护区状态" width="130" />
-        <el-table-column label="站位 / 样带" width="130" align="right">
+        <el-table-column prop="protectStatus" label="保护区状态" width="120" />
+        <el-table-column label="站位 / 样带" width="140" align="right">
           <template #default="{ row }">
-            <span class="gb-mono">{{ row.siteCount }} / {{ row.beltCount }}</span>
+            <span class="gb-mono">{{ row.siteCount }} / {{ row.conclusiveBeltCount }}<span class="gb-hint">（共 {{ row.beltCount }}）</span></span>
           </template>
         </el-table-column>
-        <el-table-column label="珊瑚记录" width="110" align="right">
+        <el-table-column label="珊瑚记录" width="100" align="right">
           <template #default="{ row }">
             <span class="gb-mono">{{ row.coralCount }}</span>
           </template>
         </el-table-column>
-        <el-table-column label="覆盖长度" width="130" align="right">
-          <template #default="{ row }">
-            <span class="gb-mono">{{ row.coverCmTotal }} cm</span>
-          </template>
-        </el-table-column>
-        <el-table-column label="平均白化指数" width="160">
+        <el-table-column label="平均白化指数" width="150">
           <template #default="{ row }">
             <BleachTag :level="row.grade" size="small" />
             <span class="gb-hint gb-mono"> {{ row.avgBleachIndex }}</span>
           </template>
         </el-table-column>
-        <el-table-column label="鱼类计数" width="120" align="right">
+        <el-table-column label="判读对账" min-width="210">
+          <template #default="{ row }">
+            <el-tag size="small" type="danger" effect="plain" class="coverage-view__status-tag">挂起 {{ row.heldCount }}</el-tag>
+            <el-tag size="small" type="warning" effect="plain" class="coverage-view__status-tag">待判 {{ row.pendingCount }}</el-tag>
+            <el-tag size="small" type="primary" effect="plain" class="coverage-view__status-tag">放行 {{ row.releasedCount }}</el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column label="鱼类计数" width="100" align="right">
           <template #default="{ row }">
             <span class="gb-mono">{{ row.fishTotal }}</span>
           </template>
@@ -440,7 +517,7 @@ onMounted(() => {
       <div class="gb-panel-title">
         <h3>结构版本与全量 JSON 导入导出</h3>
         <span class="gb-hint">
-          导出内容包含 reefs / sites / belts / corals / fishes 五张表 · 最近备份
+          导出内容包含 reefs / sites / belts / corals / fishes / interpretations 六张表 · 最近备份
           {{ lastBackupAt ? new Date(lastBackupAt).toLocaleString('zh-CN') : '尚未备份' }}
         </span>
       </div>
@@ -478,7 +555,7 @@ onMounted(() => {
         <el-descriptions-item label="结构版本">v{{ DB_VERSION }}（浏览器记录 v{{ stampedVersion }}）</el-descriptions-item>
         <el-descriptions-item label="礁区 / 站位">{{ counts.reefs }} / {{ counts.sites }}</el-descriptions-item>
         <el-descriptions-item label="样带 / 珊瑚记录">{{ counts.belts }} / {{ counts.corals }}</el-descriptions-item>
-        <el-descriptions-item label="鱼类计数">{{ counts.fishes }}</el-descriptions-item>
+        <el-descriptions-item label="鱼类 / 判读记录">{{ counts.fishes }} / {{ counts.interpretations }}</el-descriptions-item>
         <el-descriptions-item label="最近备份时间">
           {{ lastBackupAt ? new Date(lastBackupAt).toLocaleString('zh-CN') : '尚未备份' }}
         </el-descriptions-item>
@@ -529,5 +606,22 @@ onMounted(() => {
 .page__mini-bar {
   display: block;
   height: 100%;
+}
+
+.coverage-view__danger {
+  color: #b03a2e;
+  font-weight: 700;
+}
+
+.coverage-view__status-tag {
+  margin: 2px 4px 2px 0;
+}
+
+:deep(.el-table .is-held) {
+  background-color: #fdecea !important;
+}
+
+:deep(.el-table .is-pending) {
+  background-color: #fdf8ec !important;
 }
 </style>
