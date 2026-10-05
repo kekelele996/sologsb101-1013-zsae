@@ -15,22 +15,25 @@ import {
   BLEACH_LEVELS,
   type BleachLevel
 } from '@/types/coralRecord'
+import type { InterpretationRecord } from '@/types/interpretation'
 import { bleachGrade, bleachIndex, bleachedSharePct, coralCoveragePct, fishDensity, round } from '@/utils/bleach'
+import { reconcileBelt } from '@/utils/reconcile'
 
 /** 备份集合键名 */
-export const BACKUP_KEYS = ['reefs', 'sites', 'belts', 'corals', 'fishes'] as const
+export const BACKUP_KEYS = ['reefs', 'sites', 'belts', 'corals', 'fishes', 'interpretations'] as const
 export type BackupKey = (typeof BACKUP_KEYS)[number]
 
 export type CountMap = Record<BackupKey, number>
 
 /** 组装当前本地数据的完整快照 */
 export async function buildBackupPayload(): Promise<BackupPayload> {
-  const [reefs, sites, belts, corals, fishes] = await Promise.all([
+  const [reefs, sites, belts, corals, fishes, interpretations] = await Promise.all([
     db.reefs.toArray(),
     db.sites.toArray(),
     db.belts.toArray(),
     db.corals.toArray(),
-    db.fishes.toArray()
+    db.fishes.toArray(),
+    db.interpretations.toArray()
   ])
   return {
     app: 'gbcoralbelt',
@@ -40,7 +43,8 @@ export async function buildBackupPayload(): Promise<BackupPayload> {
     sites,
     belts,
     corals,
-    fishes
+    fishes,
+    interpretations
   }
 }
 
@@ -66,7 +70,8 @@ export function validateBackup(input: unknown): { ok: boolean; errors: string[];
     sites: obj.sites ?? [],
     belts: obj.belts ?? [],
     corals: obj.corals ?? [],
-    fishes: obj.fishes ?? []
+    fishes: obj.fishes ?? [],
+    interpretations: obj.interpretations ?? []
   }
   return { ok: true, errors, payload }
 }
@@ -78,7 +83,8 @@ export function countPayload(payload: BackupPayload): CountMap {
     sites: payload.sites.length,
     belts: payload.belts.length,
     corals: payload.corals.length,
-    fishes: payload.fishes.length
+    fishes: payload.fishes.length,
+    interpretations: payload.interpretations.length
   }
 }
 
@@ -114,12 +120,13 @@ export function readFileText(file: File): Promise<string> {
 /** 导入快照：overwrite=true 先清空全部表，否则按主键合并 */
 export async function importBackup(payload: BackupPayload, overwrite: boolean): Promise<CountMap> {
   if (overwrite) await clearAllTables()
-  await db.transaction('rw', [db.reefs, db.sites, db.belts, db.corals, db.fishes], async () => {
+  await db.transaction('rw', [db.reefs, db.sites, db.belts, db.corals, db.fishes, db.interpretations], async () => {
     await db.reefs.bulkPut(payload.reefs)
     await db.sites.bulkPut(payload.sites)
     await db.belts.bulkPut(payload.belts)
     await db.corals.bulkPut(payload.corals)
     await db.fishes.bulkPut(payload.fishes)
+    await db.interpretations.bulkPut(payload.interpretations)
   })
   return countPayload(payload)
 }
@@ -155,7 +162,12 @@ export function remapIds(payload: BackupPayload): BackupPayload {
     id: createId('fsh'),
     beltId: beltMap.get(fish.beltId) ?? fish.beltId
   }))
-  return { ...payload, reefs, sites, belts, corals, fishes }
+  const interpretations = payload.interpretations.map((interpretation) => ({
+    ...interpretation,
+    id: createId('intp'),
+    beltId: beltMap.get(interpretation.beltId) ?? interpretation.beltId
+  }))
+  return { ...payload, reefs, sites, belts, corals, fishes, interpretations }
 }
 
 /** 白化等级分布：各等级累计覆盖长度 */
@@ -188,6 +200,20 @@ export interface CoverageLine {
   invertebrateTotal: number
   /** 鱼类密度（尾 / 100 m²） */
   fishDensity: number
+  /** 判读覆盖率（%），未判读时为 null */
+  interpretationCoveragePct: number | null
+  /** 判读白化等级，未判读时为 null */
+  interpretationGrade: BleachLevel | null
+  /** 判读人 */
+  interpreter: string
+  /** 两侧覆盖率差异绝对值（个百分点），未判读时为 null */
+  coverageDiffPct: number | null
+  /** 对账状态 */
+  reconcileStatus: 'uninterpreted' | 'pending' | 'released'
+  /** 是否挂起（两侧差过一成） */
+  suspended: boolean
+  /** 是否未判读（按外业那份先出并标出） */
+  uninterpreted: boolean
   conclusion: string
 }
 
@@ -207,6 +233,10 @@ export function buildCoverageLines(payload: BackupPayload): CoverageLine[] {
     list.push(fish)
     fishesByBelt.set(fish.beltId, list)
   })
+  const interpretationByBelt = new Map<string, InterpretationRecord>()
+  payload.interpretations.forEach((interpretation) => {
+    interpretationByBelt.set(interpretation.beltId, interpretation)
+  })
 
   return payload.belts
     .map((belt) => {
@@ -220,6 +250,9 @@ export function buildCoverageLines(payload: BackupPayload): CoverageLine[] {
       )
       const index = bleachIndex(corals)
       const grade = bleachGrade(index)
+      const fieldCoverage = coralCoveragePct(coverCmTotal, belt.lengthM)
+      const interpretation = interpretationByBelt.get(belt.id) ?? null
+      const reconcile = reconcileBelt(fieldCoverage, interpretation)
       const distribution: BleachDistribution = { 无: 0, 轻: 0, 中: 0, 重: 0, 死亡: 0 }
       BLEACH_LEVELS.forEach((level) => {
         distribution[level] = round(
@@ -231,6 +264,19 @@ export function buildCoverageLines(payload: BackupPayload): CoverageLine[] {
       const invertebrateTotal = fishes
         .filter((fish) => fish.category === '无脊椎动物')
         .reduce((sum, fish) => sum + fish.count, 0)
+      const density = fishDensity(fishTotal, belt.lengthM)
+      let conclusion: string
+      if (corals.length === 0) {
+        conclusion = '该样带尚未录入珊瑚记录'
+      } else if (reconcile.suspended) {
+        conclusion = `外业覆盖率 ${fieldCoverage}% 与判读覆盖率 ${reconcile.interpretationCoveragePct}% 差过一成（差 ${reconcile.diffPct} 个百分点），样带挂起等复核`
+      } else if (reconcile.uninterpreted) {
+        conclusion = `珊瑚覆盖率 ${fieldCoverage}%（按外业那份先出，判读室尚未判读），白化指数 ${index}（${grade}），白化占比 ${bleachedSharePct(corals)}%`
+      } else if (grade === '无') {
+        conclusion = `珊瑚覆盖率 ${fieldCoverage}%，未见白化`
+      } else {
+        conclusion = `珊瑚覆盖率 ${fieldCoverage}%，白化指数 ${index}（${grade}），白化占比 ${bleachedSharePct(corals)}%`
+      }
       return {
         beltId: belt.id,
         beltNo: belt.no,
@@ -244,23 +290,28 @@ export function buildCoverageLines(payload: BackupPayload): CoverageLine[] {
         observer: belt.observer,
         coralCount: corals.length,
         coverCmTotal,
-        coveragePct: coralCoveragePct(coverCmTotal, belt.lengthM),
+        coveragePct: fieldCoverage,
         bleachIndex: index,
         grade,
         bleachedSharePct: bleachedSharePct(corals),
         distribution,
         fishTotal,
         invertebrateTotal,
-        fishDensity: fishDensity(fishTotal, belt.lengthM),
-        conclusion:
-          corals.length === 0
-            ? '该样带尚未录入珊瑚记录'
-            : grade === '无'
-              ? `珊瑚覆盖率 ${coralCoveragePct(coverCmTotal, belt.lengthM)}%，未见白化`
-              : `珊瑚覆盖率 ${coralCoveragePct(coverCmTotal, belt.lengthM)}%，白化指数 ${index}（${grade}），白化占比 ${bleachedSharePct(corals)}%`
+        fishDensity: density,
+        interpretationCoveragePct: reconcile.interpretationCoveragePct,
+        interpretationGrade: interpretation?.bleachLevel ?? null,
+        interpreter: interpretation?.interpreter ?? '',
+        coverageDiffPct: reconcile.diffPct,
+        reconcileStatus: reconcile.status,
+        suspended: reconcile.suspended,
+        uninterpreted: reconcile.uninterpreted,
+        conclusion
       }
     })
-    .sort((a, b) => b.bleachIndex - a.bleachIndex)
+    .sort((a, b) => {
+      if (a.suspended !== b.suspended) return a.suspended ? -1 : 1
+      return b.bleachIndex - a.bleachIndex
+    })
 }
 
 /** 按礁区汇总：站位/样带数量、平均白化指数与总体等级 */

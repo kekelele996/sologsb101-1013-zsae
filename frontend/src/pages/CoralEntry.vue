@@ -5,11 +5,12 @@
  * 支持批量粘贴与批量改白化等级，深链访问时样带不存在给出友好空态。
  * 复用 <BleachTag>、<StatBadge>。
  */
-import { computed, onMounted, reactive, ref } from 'vue'
+import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Delete, DocumentCopy, Edit, Plus } from '@element-plus/icons-vue'
 import BleachTag from '@/components/common/BleachTag.vue'
+import ReconcileTag from '@/components/common/ReconcileTag.vue'
 import StatBadge from '@/components/common/StatBadge.vue'
 import EmptyPanel from '@/components/common/EmptyPanel.vue'
 import RouteMissingPanel from '@/components/common/RouteMissingPanel.vue'
@@ -23,6 +24,7 @@ import {
   parseCoralPaste
 } from '@/types/coralRecord'
 import type { BleachLevel, CoralForm, CoralRecord } from '@/types/coralRecord'
+import { createEmptyInterpretationDraft } from '@/types/interpretation'
 import { BLEACH_BG, BLEACH_COLOR, bleachGrade, bleachIndex, bleachedSharePct, coralCoveragePct, groupByForm, groupByGenus } from '@/utils/bleach'
 import { initDatabase } from '@/utils/db'
 
@@ -91,6 +93,74 @@ const distribution = computed<Record<BleachLevel, number>>(() => {
   })
   return result
 })
+
+/* ------------------------------ 影像判读 ------------------------------ */
+
+const interpretation = computed(() => surveyStore.interpretationOfBelt(beltId.value))
+const reconcile = computed(() => surveyStore.reconcileOfBelt(beltId.value))
+const interpretForm = reactive(createEmptyInterpretationDraft())
+const posting = ref(false)
+
+// 判读记录载入或更新时同步表单（重判后回到已落账的值）
+watch(
+  interpretation,
+  (interp) => {
+    if (interp) {
+      interpretForm.coveragePct = interp.coveragePct
+      interpretForm.bleachLevel = interp.bleachLevel
+      interpretForm.interpreter = interp.interpreter
+    } else {
+      interpretForm.coveragePct = reconcile.value?.fieldCoveragePct ?? 0
+      interpretForm.bleachLevel = '无'
+      interpretForm.interpreter = ''
+    }
+  },
+  { immediate: true }
+)
+
+async function submitInterpretation(): Promise<void> {
+  if (!Number.isFinite(interpretForm.coveragePct) || interpretForm.coveragePct < 0 || interpretForm.coveragePct > 100) {
+    ElMessage.warning('判读覆盖率应为 0 ~ 100 的数字（%）')
+    return
+  }
+  posting.value = true
+  try {
+    await surveyStore.saveInterpretation(beltId.value, { ...interpretForm })
+    const result = await surveyStore.postInterpretation(beltId.value)
+    if (result.ok) {
+      ElMessage.success(interpretation.value ? '判读记录已重判并落账' : '判读记录已落账')
+    } else {
+      ElMessage.error(`落账失败：${result.error}，可重试（仅重试判读记录，外业记录不受影响）`)
+    }
+  } finally {
+    posting.value = false
+  }
+}
+
+async function retryPost(): Promise<void> {
+  posting.value = true
+  try {
+    const result = await surveyStore.retryInterpretation(beltId.value)
+    if (result.ok) ElMessage.success('判读记录已重新落账')
+    else ElMessage.error(`落账仍失败：${result.error}`)
+  } finally {
+    posting.value = false
+  }
+}
+
+async function removeInterpretation(): Promise<void> {
+  try {
+    await ElMessageBox.confirm('删除该样带的影像判读记录？外业珊瑚记录不受影响。', '删除确认', {
+      type: 'warning',
+      confirmButtonText: '删除',
+      cancelButtonText: '取消'
+    })
+  } catch {
+    return
+  }
+  await surveyStore.removeInterpretation(beltId.value)
+  ElMessage.success('判读记录已删除')
+}
 
 /** 进度条宽度（%），总量为 0 时返回 0% */
 function barPercent(value: number, total: number): string {
@@ -294,6 +364,66 @@ onMounted(() => {
         />
         <StatBadge label="白化占比" :value="stats.bleachedSharePct" suffix="%" tone="warning" icon="TrendCharts" />
       </div>
+
+      <el-card shadow="never" class="gb-panel">
+        <div class="gb-panel-title">
+          <h3>影像判读室判读</h3>
+          <span class="gb-hint">判读室用样带照片另判一版覆盖率与白化等级，与外业记录按样带编号对账（差过一成挂起等复核）</span>
+        </div>
+        <div class="page__interpret">
+          <div class="page__interpret-status">
+            <ReconcileTag v-if="reconcile" :status="reconcile.status" />
+            <span class="gb-hint">
+              外业覆盖率 <b class="gb-mono">{{ reconcile?.fieldCoveragePct }}%</b>
+              <template v-if="reconcile && reconcile.interpretationCoveragePct !== null">
+                · 判读覆盖率 <b class="gb-mono">{{ reconcile.interpretationCoveragePct }}%</b>
+                <template v-if="reconcile.diffPct !== null">· 差异 <b class="gb-mono">{{ reconcile.diffPct }}</b> 个百分点</template>
+              </template>
+              <template v-else>· 判读室尚未判读，按外业那份先出</template>
+            </span>
+          </div>
+          <el-form label-width="100px" class="page__interpret-form">
+            <el-form-item label="判读覆盖率">
+              <el-input-number
+                v-model="interpretForm.coveragePct"
+                :min="0"
+                :max="100"
+                :step="0.1"
+                :precision="1"
+                controls-position="right"
+              />
+              <span class="page__unit">%</span>
+            </el-form-item>
+            <el-form-item label="判读等级">
+              <el-radio-group v-model="interpretForm.bleachLevel">
+                <el-radio-button v-for="level in BLEACH_LEVELS" :key="level" :value="level">{{ level }}</el-radio-button>
+              </el-radio-group>
+            </el-form-item>
+            <el-form-item label="判读人">
+              <el-input v-model="interpretForm.interpreter" placeholder="如：苏晴" maxlength="20" />
+              <span v-if="interpretation?.initial" class="gb-hint">初始值（升级时按现有珊瑚记录回填）</span>
+            </el-form-item>
+            <el-form-item>
+              <el-button type="primary" :loading="posting" @click="submitInterpretation">
+                {{ interpretation ? '重判并落账' : '保存并落账' }}
+              </el-button>
+              <el-button v-if="interpretation?.status === 'failed'" type="warning" :loading="posting" @click="retryPost">
+                重试落账
+              </el-button>
+              <el-button v-if="interpretation" type="danger" plain @click="removeInterpretation">删除判读</el-button>
+              <span v-if="interpretation?.status === 'posted'" class="gb-hint">· 已落账</span>
+              <span v-else-if="interpretation?.status === 'draft'" class="gb-hint">· 草稿（未落账）</span>
+            </el-form-item>
+            <el-alert
+              v-if="interpretation?.status === 'failed' && interpretation.postError"
+              type="error"
+              :closable="false"
+              show-icon
+              :title="`落账失败：${interpretation.postError}。可重试（仅重试判读记录，外业记录不受影响）`"
+            />
+          </el-form>
+        </div>
+      </el-card>
 
       <el-card v-if="records.length > 0" shadow="never" class="gb-panel">
         <div class="gb-panel-title">
@@ -551,5 +681,30 @@ onMounted(() => {
   margin-top: 10px;
   max-height: 160px;
   overflow: auto;
+}
+
+.page__interpret {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.page__interpret-status {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+}
+
+.page__interpret-form {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  column-gap: 16px;
+  row-gap: 0;
+}
+
+.page__interpret-form :deep(.el-form-item) {
+  margin-bottom: 12px;
 }
 </style>

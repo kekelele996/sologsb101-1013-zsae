@@ -11,6 +11,13 @@ import type { CountCategory, FishCount, SizeClass } from '@/types/fishCount'
 import type { Reef } from '@/types/reef'
 import type { Site } from '@/types/site'
 import type { Belt } from '@/types/belt'
+import type { InterpretationRecord } from '@/types/interpretation'
+import {
+  fieldCoverageOfBelt,
+  reconcileBelt,
+  type ReconcileResult,
+  type ReconcileStatus
+} from '@/utils/reconcile'
 import { bleachGrade, bleachIndex, bleachedSharePct, coralCoveragePct, fishDensity, round } from '@/utils/bleach'
 
 /** 覆盖度汇总页筛选条件 */
@@ -18,6 +25,8 @@ export interface SurveyFilterState {
   keyword: string
   reefIds: string[]
   bleachLevels: BleachLevel[]
+  /** 对账状态筛选：挂起 / 未判读 / 放行 */
+  reconcileStatuses: ReconcileStatus[]
   /** 是否只看白化指数高于阈值的样带 */
   onlyBleached: boolean
 }
@@ -27,6 +36,7 @@ export function createEmptySurveyFilter(): SurveyFilterState {
     keyword: '',
     reefIds: [],
     bleachLevels: [],
+    reconcileStatuses: [],
     onlyBleached: false
   }
 }
@@ -53,6 +63,24 @@ export interface CoverageSummaryRow {
   fishTotal: number
   invertebrateTotal: number
   fishDensity: number
+  /** 判读覆盖率（%），未判读时为 null */
+  interpretationCoveragePct: number | null
+  /** 判读白化等级，未判读时为 null */
+  interpretationGrade: BleachLevel | null
+  /** 判读人 */
+  interpreter: string
+  /** 判读记录是否为初始值（升级回填） */
+  interpretationInitial: boolean
+  /** 判读记录落账状态 */
+  interpretationStatus: InterpretationRecord['status'] | null
+  /** 两侧覆盖率差异绝对值（个百分点），未判读时为 null */
+  coverageDiffPct: number | null
+  /** 对账状态 */
+  reconcileStatus: ReconcileStatus
+  /** 是否挂起（两侧差过一成） */
+  suspended: boolean
+  /** 是否未判读（按外业那份先出并标出） */
+  uninterpreted: boolean
 }
 
 export const useSurveyStore = defineStore('survey', () => {
@@ -61,6 +89,7 @@ export const useSurveyStore = defineStore('survey', () => {
   const reefs = ref<Reef[]>([])
   const sites = ref<Site[]>([])
   const belts = ref<Belt[]>([])
+  const interpretations = ref<InterpretationRecord[]>([])
   const ready = ref(false)
   const error = ref<string | null>(null)
   const filter = ref<SurveyFilterState>(createEmptySurveyFilter())
@@ -102,6 +131,9 @@ export const useSurveyStore = defineStore('survey', () => {
     watchTable<Belt>(() => db.belts).subscribe((rows) => {
       belts.value = rows
     })
+    watchTable<InterpretationRecord>(() => db.interpretations).subscribe((rows) => {
+      interpretations.value = rows
+    })
   }
 
   /** 某样带的珊瑚记录（按白化等级降序、覆盖长度降序） */
@@ -137,7 +169,7 @@ export const useSurveyStore = defineStore('survey', () => {
     return counts
   })
 
-  /** 覆盖度汇总行（全部样带） */
+  /** 覆盖度汇总行（全部样带，含影像判读对账） */
   const coverageRows = computed<CoverageSummaryRow[]>(() =>
     belts.value
       .map((belt) => {
@@ -158,6 +190,9 @@ export const useSurveyStore = defineStore('survey', () => {
         })
         const index = bleachIndex(beltCorals)
         const fishTotal = beltFishes.filter((fish) => fish.category === '鱼类').reduce((sum, fish) => sum + fish.count, 0)
+        const fieldCoverage = fieldCoverageOfBelt(beltCorals, belt.lengthM)
+        const interpretation = interpretations.value.find((item) => item.beltId === belt.id) ?? null
+        const reconcile = reconcileBelt(fieldCoverage, interpretation)
         return {
           beltId: belt.id,
           beltNo: belt.no,
@@ -171,7 +206,7 @@ export const useSurveyStore = defineStore('survey', () => {
           observer: belt.observer,
           coralCount: beltCorals.length,
           coverCmTotal,
-          coveragePct: coralCoveragePct(coverCmTotal, belt.lengthM),
+          coveragePct: fieldCoverage,
           bleachIndex: index,
           grade: bleachGrade(index),
           bleachedSharePct: bleachedSharePct(beltCorals),
@@ -180,10 +215,23 @@ export const useSurveyStore = defineStore('survey', () => {
           invertebrateTotal: beltFishes
             .filter((fish) => fish.category === '无脊椎动物')
             .reduce((sum, fish) => sum + fish.count, 0),
-          fishDensity: fishDensity(fishTotal, belt.lengthM)
+          fishDensity: fishDensity(fishTotal, belt.lengthM),
+          interpretationCoveragePct: reconcile.interpretationCoveragePct,
+          interpretationGrade: interpretation?.bleachLevel ?? null,
+          interpreter: interpretation?.interpreter ?? '',
+          interpretationInitial: interpretation?.initial ?? false,
+          interpretationStatus: interpretation?.status ?? null,
+          coverageDiffPct: reconcile.diffPct,
+          reconcileStatus: reconcile.status,
+          suspended: reconcile.suspended,
+          uninterpreted: reconcile.uninterpreted
         }
       })
-      .sort((a, b) => b.bleachIndex - a.bleachIndex)
+      .sort((a, b) => {
+        // 挂起的样带排最前，其次按白化指数降序
+        if (a.suspended !== b.suspended) return a.suspended ? -1 : 1
+        return b.bleachIndex - a.bleachIndex
+      })
   )
 
   /** 按筛选条件过滤后的覆盖度行 */
@@ -199,6 +247,9 @@ export const useSurveyStore = defineStore('survey', () => {
         const matched = filter.value.bleachLevels.some((level) => row.distribution[level] > 0)
         if (!matched) return false
       }
+      if (filter.value.reconcileStatuses.length > 0 && !filter.value.reconcileStatuses.includes(row.reconcileStatus)) {
+        return false
+      }
       if (filter.value.onlyBleached && row.bleachedSharePct <= 0) return false
       return true
     })
@@ -209,6 +260,7 @@ export const useSurveyStore = defineStore('survey', () => {
       filter.value.keyword.trim().length > 0 ||
       filter.value.reefIds.length > 0 ||
       filter.value.bleachLevels.length > 0 ||
+      filter.value.reconcileStatuses.length > 0 ||
       filter.value.onlyBleached
   )
 
@@ -372,12 +424,105 @@ export const useSurveyStore = defineStore('survey', () => {
     return Array.from(map.values()).sort((a, b) => b.total - a.total)
   }
 
+  /* ------------------------------ 影像判读 ------------------------------ */
+
+  /** 某样带的影像判读记录（一条样带最多一条） */
+  function interpretationOfBelt(beltId: string | null | undefined): InterpretationRecord | null {
+    if (!beltId) return null
+    return interpretations.value.find((item) => item.beltId === beltId) ?? null
+  }
+
+  /** 某样带的对账结果（外业覆盖率 vs 判读覆盖率） */
+  function reconcileOfBelt(beltId: string | null | undefined): ReconcileResult | null {
+    if (!beltId) return null
+    const belt = belts.value.find((item) => item.id === beltId)
+    if (!belt) return null
+    const beltCorals = corals.value.filter((coral) => coral.beltId === beltId)
+    const fieldCoverage = fieldCoverageOfBelt(beltCorals, belt.lengthM)
+    const interpretation = interpretationOfBelt(beltId)
+    return reconcileBelt(fieldCoverage, interpretation)
+  }
+
+  /** 新增或更新某样带的判读记录（存为草稿，尚未落账） */
+  async function saveInterpretation(
+    beltId: string,
+    payload: { coveragePct: number; bleachLevel: BleachLevel; interpreter: string }
+  ): Promise<InterpretationRecord> {
+    const now = Date.now()
+    const existing = interpretationOfBelt(beltId)
+    if (existing) {
+      const row: InterpretationRecord = {
+        ...existing,
+        ...payload,
+        // 重判后回到未落账状态，需要重新落账
+        status: 'draft',
+        postError: '',
+        updatedAt: now
+      }
+      await db.interpretations.put(row)
+      return row
+    }
+    const row: InterpretationRecord = {
+      ...payload,
+      beltId,
+      id: createId('intp'),
+      initial: false,
+      status: 'draft',
+      postError: '',
+      createdAt: now,
+      updatedAt: now
+    }
+    await db.interpretations.put(row)
+    return row
+  }
+
+  /**
+   * 落账：把判读记录写入判读台账。
+   * 只操作 interpretations 单表事务，外业珊瑚记录不受影响；
+   * 落账失败时只重试自己这份（retryInterpretation），不触碰外业数据。
+   */
+  async function postInterpretation(beltId: string): Promise<{ ok: boolean; error?: string }> {
+    const existing = await db.interpretations.where('beltId').equals(beltId).first()
+    if (!existing) return { ok: false, error: '尚未填写判读内容' }
+    const now = Date.now()
+    const posted: InterpretationRecord = { ...existing, status: 'posted', postError: '', updatedAt: now }
+    try {
+      await db.transaction('rw', [db.interpretations], async () => {
+        await db.interpretations.put(posted)
+      })
+      return { ok: true }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : '落账失败'
+      // 落账失败：仅把自己这份标记为 failed，外业珊瑚记录不受影响
+      try {
+        await db.transaction('rw', [db.interpretations], async () => {
+          await db.interpretations.update(existing.id, { status: 'failed', postError: message, updatedAt: Date.now() })
+        })
+      } catch {
+        // 标记失败状态也失败时忽略，保留原状态
+      }
+      return { ok: false, error: message }
+    }
+  }
+
+  /** 重试落账：只重试判读记录自己，外业那份不受影响 */
+  async function retryInterpretation(beltId: string): Promise<{ ok: boolean; error?: string }> {
+    return postInterpretation(beltId)
+  }
+
+  /** 删除某样带的判读记录（外业珊瑚记录不受影响） */
+  async function removeInterpretation(beltId: string): Promise<void> {
+    const existing = interpretationOfBelt(beltId)
+    if (existing) await db.interpretations.delete(existing.id)
+  }
+
   return {
     corals,
     fishes,
     reefs,
     sites,
     belts,
+    interpretations,
     ready,
     error,
     filter,
@@ -392,6 +537,12 @@ export const useSurveyStore = defineStore('survey', () => {
     coralsOfBelt,
     fishesOfBelt,
     fishSummaryOfBelt,
+    interpretationOfBelt,
+    reconcileOfBelt,
+    saveInterpretation,
+    postInterpretation,
+    retryInterpretation,
+    removeInterpretation,
     patchFilter,
     resetFilter,
     patchCoralDraft,

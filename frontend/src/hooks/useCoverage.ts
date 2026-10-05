@@ -11,6 +11,8 @@ import { useSurveyStore } from '@/stores/surveyStore'
 import type { BleachLevel, CoralRecord, CoralForm } from '@/types/coralRecord'
 import { BLEACH_LEVELS } from '@/types/coralRecord'
 import type { FishCount } from '@/types/fishCount'
+import type { InterpretationRecord } from '@/types/interpretation'
+import { fieldCoverageOfBelt, reconcileBelt, type ReconcileStatus } from '@/utils/reconcile'
 import {
   bleachGrade,
   bleachIndex,
@@ -53,6 +55,20 @@ export interface BeltCoverage {
   invertebrateTotal: number
   /** 鱼类密度（尾 / 100 m²） */
   fishDensity: number
+  /** 判读覆盖率（%），未判读时为 null */
+  interpretationCoveragePct: number | null
+  /** 判读白化等级，未判读时为 null */
+  interpretationGrade: BleachLevel | null
+  /** 判读人 */
+  interpreter: string
+  /** 两侧覆盖率差异绝对值（个百分点），未判读时为 null */
+  coverageDiffPct: number | null
+  /** 对账状态 */
+  reconcileStatus: ReconcileStatus
+  /** 是否挂起（两侧差过一成） */
+  suspended: boolean
+  /** 是否未判读（按外业那份先出并标出） */
+  uninterpreted: boolean
 }
 
 /** 单个站位的覆盖度汇总 */
@@ -120,7 +136,7 @@ export function useCoverage(): UseCoverageResult {
 
   const { reefs, sites } = storeToRefs(reefStore)
   const { belts } = storeToRefs(beltStore)
-  const { corals, fishes } = storeToRefs(surveyStore)
+  const { corals, fishes, interpretations } = storeToRefs(surveyStore)
 
   const siteOf = (siteId: string) => sites.value.find((site) => site.id === siteId) ?? null
   const reefOf = (reefId: string) => reefs.value.find((reef) => reef.id === reefId) ?? null
@@ -148,6 +164,9 @@ export function useCoverage(): UseCoverageResult {
     const invertebrateTotal = beltFishes
       .filter((fish) => fish.category === '无脊椎动物')
       .reduce((sum, fish) => sum + fish.count, 0)
+    const fieldCoverage = fieldCoverageOfBelt(beltCorals, belt.lengthM)
+    const interpretation = interpretations.value.find((item) => item.beltId === belt.id) ?? null
+    const reconcile = reconcileBelt(fieldCoverage, interpretation)
     return {
       beltId: belt.id,
       beltNo: belt.no,
@@ -161,7 +180,7 @@ export function useCoverage(): UseCoverageResult {
       observer: belt.observer,
       coralCount: beltCorals.length,
       coverCmTotal,
-      coveragePct: coralCoveragePct(coverCmTotal, belt.lengthM),
+      coveragePct: fieldCoverage,
       bleachIndex: index,
       grade: bleachGrade(index),
       bleachedSharePct: bleachedSharePct(beltCorals),
@@ -170,7 +189,14 @@ export function useCoverage(): UseCoverageResult {
       byForm: groupByForm(beltCorals),
       fishTotal,
       invertebrateTotal,
-      fishDensity: fishDensity(fishTotal, belt.lengthM)
+      fishDensity: fishDensity(fishTotal, belt.lengthM),
+      interpretationCoveragePct: reconcile.interpretationCoveragePct,
+      interpretationGrade: interpretation?.bleachLevel ?? null,
+      interpreter: interpretation?.interpreter ?? '',
+      coverageDiffPct: reconcile.diffPct,
+      reconcileStatus: reconcile.status,
+      suspended: reconcile.suspended,
+      uninterpreted: reconcile.uninterpreted
     }
   }
 

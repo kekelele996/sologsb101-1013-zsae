@@ -108,7 +108,7 @@ function go(path: string): void {
       </span>
       <span>
         礁区 {{ reefStore.reefs.length }} · 站位 {{ reefStore.sites.length }} · 样带 {{ beltStore.belts.length }} · 珊瑚记录
-        {{ surveyStore.corals.length }} · 计数记录 {{ surveyStore.fishes.length }}
+        {{ surveyStore.corals.length }} · 判读记录 {{ surveyStore.interpretations.length }} · 计数记录 {{ surveyStore.fishes.length }}
       </span>
     </footer>
   </div>

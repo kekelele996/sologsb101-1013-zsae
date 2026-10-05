@@ -13,12 +13,14 @@ import FilterBar from '@/components/common/FilterBar.vue'
 import type { FilterModel } from '@/types/filter'
 import { buildQuery, queryToArray, queryToBool } from '@/types/filter'
 import BleachTag from '@/components/common/BleachTag.vue'
+import ReconcileTag from '@/components/common/ReconcileTag.vue'
 import StatBadge from '@/components/common/StatBadge.vue'
 import EmptyPanel from '@/components/common/EmptyPanel.vue'
 import { useReefStore } from '@/stores/reefStore'
 import { useSurveyStore } from '@/stores/surveyStore'
 import { BLEACH_LEVELS } from '@/types/coralRecord'
 import type { BleachLevel } from '@/types/coralRecord'
+import { RECONCILE_STATUS_LABEL, type ReconcileStatus } from '@/utils/reconcile'
 import { BLEACH_COLOR } from '@/utils/bleach'
 import {
   DB_NAME,
@@ -46,7 +48,7 @@ const router = useRouter()
 const reefStore = useReefStore()
 const surveyStore = useSurveyStore()
 
-const EMPTY_COUNTS: CountMap = { reefs: 0, sites: 0, belts: 0, corals: 0, fishes: 0 }
+const EMPTY_COUNTS: CountMap = { reefs: 0, sites: 0, belts: 0, corals: 0, fishes: 0, interpretations: 0 }
 
 const counts = ref<CountMap>(EMPTY_COUNTS)
 const lastBackupAt = ref<string | null>(null)
@@ -60,7 +62,8 @@ const notice = ref('')
 const filterModel = computed<FilterModel>(() => ({
   keyword: surveyStore.filter.keyword,
   reefIds: surveyStore.filter.reefIds,
-  bleachLevels: surveyStore.filter.bleachLevels
+  bleachLevels: surveyStore.filter.bleachLevels,
+  reconcileStatuses: surveyStore.filter.reconcileStatuses
 }))
 
 const rows = computed(() => surveyStore.filteredCoverageRows)
@@ -79,6 +82,13 @@ const totals = computed(() => ({
       ? 0
       : Number((rows.value.reduce((sum, row) => sum + row.bleachIndex, 0) / rows.value.length).toFixed(2)),
   bleachedBelts: rows.value.filter((row) => row.bleachedSharePct > 0).length
+}))
+
+/** 对账状态统计：挂起 / 未判读 / 已判读 */
+const reconcileStats = computed(() => ({
+  pending: rows.value.filter((row) => row.reconcileStatus === 'pending').length,
+  uninterpreted: rows.value.filter((row) => row.reconcileStatus === 'uninterpreted').length,
+  released: rows.value.filter((row) => row.reconcileStatus === 'released').length
 }))
 
 /** 当前筛选结果内的白化等级分布 */
@@ -125,6 +135,13 @@ async function refresh(): Promise<void> {
     fishTotal: row.fishTotal,
     invertebrateTotal: row.invertebrateTotal,
     fishDensity: row.fishDensity,
+    interpretationCoveragePct: row.interpretationCoveragePct,
+    interpretationGrade: row.interpretationGrade,
+    interpreter: row.interpreter,
+    coverageDiffPct: row.coverageDiffPct,
+    reconcileStatus: row.reconcileStatus,
+    suspended: row.suspended,
+    uninterpreted: row.uninterpreted,
     conclusion: ''
   })))
 }
@@ -135,6 +152,7 @@ function handleFilterChange(): void {
       kw: surveyStore.filter.keyword,
       reef: surveyStore.filter.reefIds,
       level: surveyStore.filter.bleachLevels,
+      reconcile: surveyStore.filter.reconcileStatuses,
       bleached: surveyStore.filter.onlyBleached
     })
   })
@@ -235,6 +253,7 @@ onMounted(() => {
     keyword: typeof route.query.kw === 'string' ? route.query.kw : '',
     reefIds: queryToArray(route.query.reef),
     bleachLevels: queryToArray(route.query.level) as BleachLevel[],
+    reconcileStatuses: queryToArray(route.query.reconcile) as ReconcileStatus[],
     onlyBleached: queryToBool(route.query.bleached)
   })
   void refresh()
@@ -276,6 +295,13 @@ onMounted(() => {
       <StatBadge label="鱼类合计" :value="totals.fishTotal" suffix="尾" tone="warning" icon="TrendCharts" />
     </div>
 
+    <div class="gb-stats-row">
+      <StatBadge label="对账挂起" :value="reconcileStats.pending" suffix="条" tone="danger" icon="Warning" />
+      <StatBadge label="未判读（按外业出）" :value="reconcileStats.uninterpreted" suffix="条" tone="warning" icon="InfoFilled" />
+      <StatBadge label="已放行" :value="reconcileStats.released" suffix="条" tone="success" icon="CircleCheckFilled" />
+      <StatBadge label="判读记录" :value="counts.interpretations" suffix="条" tone="info" icon="Histogram" />
+    </div>
+
     <FilterBar
       :model-value="filterModel"
       :selects="[
@@ -288,6 +314,14 @@ onMounted(() => {
           key: 'bleachLevels',
           label: '白化等级',
           options: BLEACH_LEVELS.map((level) => ({ label: level, value: level }))
+        },
+        {
+          key: 'reconcileStatuses',
+          label: '对账状态',
+          options: (['pending', 'uninterpreted', 'released'] as ReconcileStatus[]).map((status) => ({
+            label: RECONCILE_STATUS_LABEL[status],
+            value: status
+          }))
         }
       ]"
       :has-switch="true"
@@ -354,6 +388,25 @@ onMounted(() => {
           <template #default="{ row }">
             <span class="gb-mono">{{ row.coveragePct }}%</span>
             <div class="gb-hint gb-mono">{{ row.coverCmTotal }} cm</div>
+          </template>
+        </el-table-column>
+        <el-table-column label="判读覆盖率" width="130" align="right">
+          <template #default="{ row }">
+            <span v-if="row.interpretationCoveragePct !== null" class="gb-mono">{{ row.interpretationCoveragePct }}%</span>
+            <span v-else class="gb-hint">未判读</span>
+            <div v-if="row.coverageDiffPct !== null" class="gb-hint gb-mono">差 {{ row.coverageDiffPct }} 个百分点</div>
+          </template>
+        </el-table-column>
+        <el-table-column label="判读等级" width="120">
+          <template #default="{ row }">
+            <BleachTag v-if="row.interpretationGrade" :level="row.interpretationGrade" size="small" plain />
+            <span v-else class="gb-hint">—</span>
+          </template>
+        </el-table-column>
+        <el-table-column label="对账状态" width="120">
+          <template #default="{ row }">
+            <ReconcileTag :status="row.reconcileStatus" size="small" />
+            <div v-if="row.interpretationInitial" class="gb-hint">初始值</div>
           </template>
         </el-table-column>
         <el-table-column label="白化评定" width="170">
@@ -440,7 +493,7 @@ onMounted(() => {
       <div class="gb-panel-title">
         <h3>结构版本与全量 JSON 导入导出</h3>
         <span class="gb-hint">
-          导出内容包含 reefs / sites / belts / corals / fishes 五张表 · 最近备份
+          导出内容包含 reefs / sites / belts / corals / fishes / interpretations 六张表 · 最近备份
           {{ lastBackupAt ? new Date(lastBackupAt).toLocaleString('zh-CN') : '尚未备份' }}
         </span>
       </div>
@@ -478,7 +531,7 @@ onMounted(() => {
         <el-descriptions-item label="结构版本">v{{ DB_VERSION }}（浏览器记录 v{{ stampedVersion }}）</el-descriptions-item>
         <el-descriptions-item label="礁区 / 站位">{{ counts.reefs }} / {{ counts.sites }}</el-descriptions-item>
         <el-descriptions-item label="样带 / 珊瑚记录">{{ counts.belts }} / {{ counts.corals }}</el-descriptions-item>
-        <el-descriptions-item label="鱼类计数">{{ counts.fishes }}</el-descriptions-item>
+        <el-descriptions-item label="鱼类 / 判读记录">{{ counts.fishes }} / {{ counts.interpretations }}</el-descriptions-item>
         <el-descriptions-item label="最近备份时间">
           {{ lastBackupAt ? new Date(lastBackupAt).toLocaleString('zh-CN') : '尚未备份' }}
         </el-descriptions-item>

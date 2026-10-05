@@ -11,9 +11,11 @@ import type { Site } from '@/types/site'
 import type { Belt } from '@/types/belt'
 import type { CoralRecord } from '@/types/coralRecord'
 import type { FishCount } from '@/types/fishCount'
+import type { InterpretationRecord } from '@/types/interpretation'
+import { initialInterpretationFromCorals } from '@/utils/reconcile'
 
 /** 当前数据结构版本号：每次调整字段结构必须 +1 并补迁移 */
-export const DB_VERSION = 2
+export const DB_VERSION = 3
 
 /** 数据库名（浏览器 IndexedDB 中的库名） */
 export const DB_NAME = 'gbcoralbelt'
@@ -35,6 +37,7 @@ export interface BackupPayload {
   belts: Belt[]
   corals: CoralRecord[]
   fishes: FishCount[]
+  interpretations: InterpretationRecord[]
 }
 
 export class CoralBeltDatabase extends Dexie {
@@ -43,6 +46,7 @@ export class CoralBeltDatabase extends Dexie {
   belts!: Table<Belt, string>
   corals!: Table<CoralRecord, string>
   fishes!: Table<FishCount, string>
+  interpretations!: Table<InterpretationRecord, string>
 
   constructor() {
     super(DB_NAME)
@@ -57,7 +61,7 @@ export class CoralBeltDatabase extends Dexie {
     })
 
     // v2：补齐筛选与统计需要的索引（位置/面积、经纬度/水深、样带长度与朝向、白化等级、类别）
-    this.version(DB_VERSION)
+    this.version(2)
       .stores({
         reefs: 'id, name, location, protectStatus, areaKm2, manager, updatedAt',
         sites: 'id, reefId, no, lat, lng, depthM, substrate, updatedAt',
@@ -85,6 +89,25 @@ export class CoralBeltDatabase extends Dexie {
               Object.assign(row, factory())
             })
         }
+      })
+
+    // v3：新增影像判读记录表（与外业珊瑚记录各留各的，按样带编号对账）；
+    // 旧数据没有判读记录，升级时按现有珊瑚记录补一版并标成初始值。
+    this.version(DB_VERSION)
+      .stores({
+        interpretations: 'id, beltId, status, initial, updatedAt'
+      })
+      .upgrade(async (tx) => {
+        const now = Date.now()
+        const belts = await tx.table('belts').toArray()
+        const corals = await tx.table('corals').toArray()
+        const interpretations: InterpretationRecord[] = []
+        for (const belt of belts) {
+          const beltCorals = corals.filter((coral: CoralRecord) => coral.beltId === belt.id)
+          const seed = initialInterpretationFromCorals(belt.id as string, beltCorals, belt.lengthM as number, now)
+          interpretations.push({ ...seed, id: createId('intp') })
+        }
+        if (interpretations.length > 0) await tx.table('interpretations').bulkPut(interpretations)
       })
   }
 }
@@ -132,6 +155,15 @@ interface SeedFish {
   category: FishCount['category']
 }
 
+interface SeedInterpretation {
+  id: string
+  beltId: string
+  coveragePct: number
+  bleachLevel: CoralRecord['bleachLevel']
+  interpreter: string
+  initial: boolean
+}
+
 interface SeedBelt {
   id: string
   siteId: string
@@ -142,6 +174,8 @@ interface SeedBelt {
   observer: string
   corals: SeedCoral[]
   fishes: SeedFish[]
+  /** 影像判读记录；缺省表示判读室尚未判读（按外业那份先出并标出） */
+  interpretation?: SeedInterpretation
 }
 
 /**
@@ -238,7 +272,15 @@ export async function seedDemoData(): Promise<void> {
         { id: 'fsh_ql01a_2', beltId: 'belt_ql01_a', family: '蝴蝶鱼科', count: 18, sizeClass: '11-20cm', category: '鱼类' },
         { id: 'fsh_ql01a_3', beltId: 'belt_ql01_a', family: '鹦嘴鱼科', count: 7, sizeClass: '21-30cm', category: '鱼类' },
         { id: 'fsh_ql01a_4', beltId: 'belt_ql01_a', family: '海胆科', count: 12, sizeClass: '0-10cm', category: '无脊椎动物' }
-      ]
+      ],
+      interpretation: {
+        id: 'intp_ql01a_1',
+        beltId: 'belt_ql01_a',
+        coveragePct: 58,
+        bleachLevel: '轻',
+        interpreter: '苏晴',
+        initial: false
+      }
     },
     {
       id: 'belt_ql01_b',
@@ -257,7 +299,15 @@ export async function seedDemoData(): Promise<void> {
         { id: 'fsh_ql01b_1', beltId: 'belt_ql01_b', family: '隆头鱼科', count: 22, sizeClass: '11-20cm', category: '鱼类' },
         { id: 'fsh_ql01b_2', beltId: 'belt_ql01_b', family: '刺尾鱼科', count: 15, sizeClass: '21-30cm', category: '鱼类' },
         { id: 'fsh_ql01b_3', beltId: 'belt_ql01_b', family: '砗磲科', count: 3, sizeClass: '>30cm', category: '无脊椎动物' }
-      ]
+      ],
+      interpretation: {
+        id: 'intp_ql01b_1',
+        beltId: 'belt_ql01_b',
+        coveragePct: 55,
+        bleachLevel: '中',
+        interpreter: '苏晴',
+        initial: false
+      }
     },
     {
       id: 'belt_ql02_a',
@@ -293,7 +343,15 @@ export async function seedDemoData(): Promise<void> {
         { id: 'fsh_yr01a_1', beltId: 'belt_yr01_a', family: '笛鲷科', count: 28, sizeClass: '21-30cm', category: '鱼类' },
         { id: 'fsh_yr01a_2', beltId: 'belt_yr01_a', family: '篮子鱼科', count: 11, sizeClass: '11-20cm', category: '鱼类' },
         { id: 'fsh_yr01a_3', beltId: 'belt_yr01_a', family: '法螺科', count: 2, sizeClass: '>30cm', category: '无脊椎动物' }
-      ]
+      ],
+      interpretation: {
+        id: 'intp_yr01a_1',
+        beltId: 'belt_yr01_a',
+        coveragePct: 27,
+        bleachLevel: '中',
+        interpreter: '林岚',
+        initial: false
+      }
     },
     {
       id: 'belt_dz01_a',
@@ -310,11 +368,19 @@ export async function seedDemoData(): Promise<void> {
       fishes: [
         { id: 'fsh_dz01a_1', beltId: 'belt_dz01_a', family: '雀鲷科', count: 34, sizeClass: '0-10cm', category: '鱼类' },
         { id: 'fsh_dz01a_2', beltId: 'belt_dz01_a', family: '海星科', count: 5, sizeClass: '11-20cm', category: '无脊椎动物' }
-      ]
+      ],
+      interpretation: {
+        id: 'intp_dz01a_1',
+        beltId: 'belt_dz01_a',
+        coveragePct: 33.2,
+        bleachLevel: '重',
+        interpreter: '林岚',
+        initial: false
+      }
     }
   ]
 
-  await db.transaction('rw', [db.reefs, db.sites, db.belts, db.corals, db.fishes], async () => {
+  await db.transaction('rw', [db.reefs, db.sites, db.belts, db.corals, db.fishes, db.interpretations], async () => {
     const stamp = (offset: number): { createdAt: number; updatedAt: number } => ({
       createdAt: now + offset,
       updatedAt: now + offset
@@ -324,9 +390,10 @@ export async function seedDemoData(): Promise<void> {
     await db.sites.bulkPut(sites.map((site, index) => ({ ...site, ...stamp(100 + index) })))
     await db.belts.bulkPut(
       belts.map((belt, index) => {
-        const { corals, fishes, ...rest } = belt
+        const { corals, fishes, interpretation, ...rest } = belt
         void corals
         void fishes
+        void interpretation
         return { ...rest, ...stamp(200 + index) }
       })
     )
@@ -338,6 +405,13 @@ export async function seedDemoData(): Promise<void> {
     await db.fishes.bulkPut(
       belts.flatMap((belt, beltIndex) =>
         belt.fishes.map((fish, fishIndex) => ({ ...fish, ...stamp(400 + beltIndex * 100 + fishIndex) }))
+      )
+    )
+    await db.interpretations.bulkPut(
+      belts.flatMap((belt, beltIndex) =>
+        belt.interpretation
+          ? [{ ...belt.interpretation, status: 'posted' as const, postError: '', ...stamp(500 + beltIndex * 100) }]
+          : []
       )
     )
   })
@@ -355,8 +429,15 @@ export async function initDatabase(): Promise<void> {
 
 /** 清空全部业务表（导入覆盖与重置共用） */
 export async function clearAllTables(): Promise<void> {
-  await db.transaction('rw', [db.reefs, db.sites, db.belts, db.corals, db.fishes], async () => {
-    await Promise.all([db.reefs.clear(), db.sites.clear(), db.belts.clear(), db.corals.clear(), db.fishes.clear()])
+  await db.transaction('rw', [db.reefs, db.sites, db.belts, db.corals, db.fishes, db.interpretations], async () => {
+    await Promise.all([
+      db.reefs.clear(),
+      db.sites.clear(),
+      db.belts.clear(),
+      db.corals.clear(),
+      db.fishes.clear(),
+      db.interpretations.clear()
+    ])
   })
 }
 
@@ -368,14 +449,15 @@ export async function resetDatabase(): Promise<void> {
 
 /** 统计各表行数，供页脚概览与覆盖度页展示 */
 export async function countAll(): Promise<Record<string, number>> {
-  const [reefs, sites, belts, corals, fishes] = await Promise.all([
+  const [reefs, sites, belts, corals, fishes, interpretations] = await Promise.all([
     db.reefs.count(),
     db.sites.count(),
     db.belts.count(),
     db.corals.count(),
-    db.fishes.count()
+    db.fishes.count(),
+    db.interpretations.count()
   ])
-  return { reefs, sites, belts, corals, fishes }
+  return { reefs, sites, belts, corals, fishes, interpretations }
 }
 
 /** 写入结构版本号到 localStorage，便于覆盖度页比对 */
